@@ -6,7 +6,6 @@
 #include "ViveSR_RigidReconstructionEnums.h"
 #include "ViveSR_Enums.h"
 #include "SRWorks.h"
-#include <cmath>
 #include "DrawDebugHelpers.h"
 #include "Math/UnrealMathUtility.h"
 #include <algorithm>
@@ -60,8 +59,8 @@ void AViveSR_RigidReconstructionRender::Initial()
 
     
     if (DisplayMode == ReconstructionDisplayMode::ADAPTIVE_MESH) {
-        adaptive_range_min = pow(2, (int)MinGridSize + 1);
-        adaptive_range_max = pow(2, (int)MaxGridSize + 1);
+        adaptive_range_min = FMath::Pow(2.0f, (int)MinGridSize + 1);
+        adaptive_range_max = FMath::Pow(2.0f, (int)MaxGridSize + 1);
         if (adaptive_range_min <= adaptive_range_max) {
             ViveSR::SRWork::RigidReconstruction::SetReconstructionParameterFloat(ViveSR::RigidReconstruction::Param::ADAPTIVE_MAX_GRID, adaptive_range_max* 0.01f);
             ViveSR::SRWork::RigidReconstruction::SetReconstructionParameterFloat(ViveSR::RigidReconstruction::Param::ADAPTIVE_MIN_GRID, adaptive_range_min* 0.01f);

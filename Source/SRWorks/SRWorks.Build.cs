@@ -62,10 +62,12 @@ public class SRWorks : ModuleRules
                 "Projects",
                 "ProceduralMeshComponent",
                 "XmlParser",
+                "D3D12RHI",
                 "D3D11RHI"
+
 				// ... add other public dependencies that you statically link with here ...
 			}
-			);
+            );
 			
 		
 		PrivateDependencyModuleNames.AddRange(

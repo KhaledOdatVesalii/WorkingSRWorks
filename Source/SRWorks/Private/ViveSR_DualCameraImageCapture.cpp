@@ -1,12 +1,14 @@
 // Fill out your copyright notice in the Description page of Project Settings.
-
 #include "ViveSR_DualCameraImageCapture.h"
 #include "SRWorks.h"
 #include "ViveSR_Enums.h"
 #include "SRWork_Client_API.h"
+#include "D3D12RHI.h"
 #include "Math/UnrealMathUtility.h"
 #include <algorithm>
-
+#include <d3d12.h>
+#include <wrl/client.h>
+using Microsoft::WRL::ComPtr;
 struct CameraSettings
 {
     int32_t Status;
@@ -18,11 +20,36 @@ struct CameraSettings
     int32_t Value;
     int32_t Mode;  // AUTO = 1, MANUAL = 2
 };
+ID3D12CommandQueue* CreateD3D12CommandQueue(ID3D12Device* device)
+{
+    if (!device) return nullptr;
 
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    queueDesc.NodeMask = 0;
+
+    ID3D12CommandQueue* cmdQueue = nullptr;
+    HRESULT hr = device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&cmdQueue));
+    if (FAILED(hr)) {
+        UE_LOG(LogTemp, Warning, TEXT("Failed to create D3D12 command queue. HRESULT: 0x%08X"), hr);
+        return nullptr;
+    }
+    return cmdQueue;
+}
+
+// Utility: Release a D3D12 command queue
+void ReleaseD3D12CommandQueue(ID3D12CommandQueue* cmdQueue)
+{
+    if (cmdQueue) {
+        cmdQueue->Release();
+    }
+}
 ViveSR_DualCameraImageCapture* ViveSR_DualCameraImageCapture::Mgr = nullptr;
 ViveSR_DualCameraImageCapture::ViveSR_DualCameraImageCapture()
 {
-	
+
 }
 
 ViveSR_DualCameraImageCapture::~ViveSR_DualCameraImageCapture()
@@ -34,14 +61,23 @@ ViveSR_DualCameraImageCapture::~ViveSR_DualCameraImageCapture()
 
 void ViveSR_DualCameraImageCapture::Initial()
 {
-	GetParameters();
-    
+    GetParameters();
     // D3D11Device
-    native_device = (ID3D11Device*)GDynamicRHI->RHIGetNativeDevice();
-    native_device->GetImmediateContext(&device_context);
-    
+    FString RHIName = GDynamicRHI->GetName();
+    if (RHIName == TEXT("D3D11")) {
+        native_device = (ID3D11Device*)GDynamicRHI->RHIGetNativeDevice();
+        if (native_device) {
+            ((ID3D11Device*)native_device)->GetImmediateContext(&device_context);
+        }
+    }
+    else if (RHIName == TEXT("D3D12")) {
+        // For D3D12, get the ID3D12Device pointer
+        native_device = (ID3D12Device*)GDynamicRHI->RHIGetNativeDevice();
+        // Note: D3D12 does not use device context in the same way as D3D11
+        device_context = nullptr;
+    }
 
-	// Distorted
+    // Distorted
     if (is_gpu_path) {
         if (img4K_ready) {
             distorted_texture_left = UTexture2D::CreateTransient(distorted_img_width, distorted_img_height, EPixelFormat::PF_B8G8R8A8);
@@ -67,13 +103,13 @@ void ViveSR_DualCameraImageCapture::Initial()
             distorted_texture_right = UTexture2D::CreateTransient(distorted_img_width, distorted_img_height, EPixelFormat::PF_R8G8B8A8);
         }
     }
-	distorted_texture_left->AddToRoot();
-	distorted_texture_right->AddToRoot();
-	distorted_texture_left->UpdateResource();
-	distorted_texture_right->UpdateResource();
-	distorted_texture_region = new FUpdateTextureRegion2D(0, 0, 0, 0, distorted_img_width, distorted_img_height);
- 
-	// Undistorted	
+    distorted_texture_left->AddToRoot();
+    distorted_texture_right->AddToRoot();
+    distorted_texture_left->UpdateResource();
+    distorted_texture_right->UpdateResource();
+    distorted_texture_region = new FUpdateTextureRegion2D(0, 0, 0, 0, distorted_img_width, distorted_img_height);
+
+    // Undistorted	
     if (is_gpu_path) {
         if (img4K_ready) {
             undistorted_texture_left = UTexture2D::CreateTransient(undistorted_img_width, undistorted_img_height, EPixelFormat::PF_R8G8B8A8);
@@ -99,19 +135,19 @@ void ViveSR_DualCameraImageCapture::Initial()
             undistorted_texture_right = UTexture2D::CreateTransient(undistorted_img_width, undistorted_img_height, EPixelFormat::PF_R8G8B8A8);
         }
     }
-	undistorted_texture_left->AddToRoot();
-	undistorted_texture_right->AddToRoot();
-	undistorted_texture_left->UpdateResource();
-	undistorted_texture_right->UpdateResource();
-	undistorted_texture_region = new FUpdateTextureRegion2D(0, 0, 0, 0, undistorted_img_width, undistorted_img_height);
-	//Depth
-	depth_raw = new uint8[depth_img_width * depth_img_height * depth_img_channel * sizeof(float)];
-	depth_texture = UTexture2D::CreateTransient(depth_img_width, depth_img_height, EPixelFormat::PF_R32_FLOAT);
-	depth_texture->AddToRoot();
-	depth_texture->UpdateResource();
-	depth_texture_region = new FUpdateTextureRegion2D(0, 0, 0, 0, depth_img_width, depth_img_height);
+    undistorted_texture_left->AddToRoot();
+    undistorted_texture_right->AddToRoot();
+    undistorted_texture_left->UpdateResource();
+    undistorted_texture_right->UpdateResource();
+    undistorted_texture_region = new FUpdateTextureRegion2D(0, 0, 0, 0, undistorted_img_width, undistorted_img_height);
+    //Depth
+    depth_raw = new uint8[depth_img_width * depth_img_height * depth_img_channel * sizeof(float)];
+    depth_texture = UTexture2D::CreateTransient(depth_img_width, depth_img_height, EPixelFormat::PF_R32_FLOAT);
+    depth_texture->AddToRoot();
+    depth_texture->UpdateResource();
+    depth_texture_region = new FUpdateTextureRegion2D(0, 0, 0, 0, depth_img_width, depth_img_height);
 
-	// PassThrough
+    // PassThrough
     if (!img4K_ready) {
         pass_through_data = new ViveSR::SRWork::PassThrough::PassThroughData();
         pass_through_data->distorted_frame_left = new char[distorted_img_width * distorted_img_height * distorted_img_channel];
@@ -126,8 +162,8 @@ void ViveSR_DualCameraImageCapture::Initial()
     }
     else {
         pass_through4K_data = new ViveSR::SRWork::PassThrough4K::PassThrough4KData();
-       // pass_through4K_data->distorted_4k_frame_left = new char[distorted_img_width * distorted_img_height * distorted_img_channel];
-       // pass_through4K_data->distorted_4k_frame_right = new char[distorted_img_width * distorted_img_height * distorted_img_channel];
+        // pass_through4K_data->distorted_4k_frame_left = new char[distorted_img_width * distorted_img_height * distorted_img_channel];
+        // pass_through4K_data->distorted_4k_frame_right = new char[distorted_img_width * distorted_img_height * distorted_img_channel];
         pass_through4K_data->undistorted_4k_frame_left = new char[undistorted_img_width * undistorted_img_height * UndistortedImageChannel];
         pass_through4K_data->undistorted_4k_frame_right = new char[undistorted_img_width * undistorted_img_height * UndistortedImageChannel];
         pass_through4K_data->output4k_pose_left = new float[16];
@@ -136,41 +172,41 @@ void ViveSR_DualCameraImageCapture::Initial()
         pass_through4K_data->d3d11_texture2d_shared_handle_left = new char[sizeof(HANDLE)];
         pass_through4K_data->d3d11_texture2d_shared_handle_right = new char[sizeof(HANDLE)];
     }
-	// Depth
-	depth_data = new ViveSR::SRWork::Depth::DepthData();
-	depth_data->left_frame = new char[640 * 480 * 4];
-	depth_data->depth_map = new float[640 * 480 * 1];
-	depth_data->pose = new float[16];
-	depth_data->camera_params = new char[1032];
+    // Depth
+    depth_data = new ViveSR::SRWork::Depth::DepthData();
+    depth_data->left_frame = new char[640 * 480 * 4];
+    depth_data->depth_map = new float[640 * 480 * 1];
+    depth_data->pose = new float[16];
+    depth_data->camera_params = new char[1032];
 }
 void ViveSR_DualCameraImageCapture::Release() {
-	is_depth_processing = false;
-	is_depth_refinement_enabled = false;
-	is_depth_edge_enhance_enabled = false;
-    
+    is_depth_processing = false;
+    is_depth_refinement_enabled = false;
+    is_depth_edge_enhance_enabled = false;
+
     srv_left.clear();
     srv_right.clear();
     idx_map.Empty();
 
-	if (distorted_raw_bgra_left) delete[] distorted_raw_bgra_left;
-	if (distorted_raw_bgra_right) delete[] distorted_raw_bgra_right;
-	if (distorted_texture_region) FMemory::Free(distorted_texture_region);
-	if (undistorted_raw_bgra_left) delete[] undistorted_raw_bgra_left;
-	if (undistorted_raw_bgra_right) delete[] undistorted_raw_bgra_right;
-	if (undistorted_texture_region) FMemory::Free(undistorted_texture_region);
-	if (depth_raw) delete[] depth_raw;
-	if (depth_texture_region) FMemory::Free(depth_texture_region);
-	// Device
+    if (distorted_raw_bgra_left) delete[] distorted_raw_bgra_left;
+    if (distorted_raw_bgra_right) delete[] distorted_raw_bgra_right;
+    if (distorted_texture_region) FMemory::Free(distorted_texture_region);
+    if (undistorted_raw_bgra_left) delete[] undistorted_raw_bgra_left;
+    if (undistorted_raw_bgra_right) delete[] undistorted_raw_bgra_right;
+    if (undistorted_texture_region) FMemory::Free(undistorted_texture_region);
+    if (depth_raw) delete[] depth_raw;
+    if (depth_texture_region) FMemory::Free(depth_texture_region);
+    // Device
     if (native_device) {
         native_device = nullptr;
     }
     if (device_context) {
         device_context = nullptr;
     }
-	// PassThrough
-	if (pass_through_data) {
-        if (pass_through_data->distorted_frame_left){ 
-            delete[] pass_through_data->distorted_frame_left; pass_through_data->distorted_frame_left=nullptr; 
+    // PassThrough
+    if (pass_through_data) {
+        if (pass_through_data->distorted_frame_left) {
+            delete[] pass_through_data->distorted_frame_left; pass_through_data->distorted_frame_left = nullptr;
         }
         if (pass_through_data->distorted_frame_right) {
             delete[] pass_through_data->distorted_frame_right; pass_through_data->distorted_frame_right = nullptr;
@@ -196,7 +232,7 @@ void ViveSR_DualCameraImageCapture::Release() {
         if (pass_through_data->camera_params) {
             delete[] pass_through_data->camera_params; pass_through_data->camera_params = nullptr;
         }
-	}
+    }
     // PassThrough4K
     if (pass_through4K_data) {
         if (pass_through4K_data->undistorted_4k_frame_left) {
@@ -229,8 +265,8 @@ void ViveSR_DualCameraImageCapture::Release() {
             delete[] pass_through4K_data->d3d11_texture2d_shared_handle_right; pass_through4K_data->d3d11_texture2d_shared_handle_right = nullptr;
         }
     }
-	// Depth
-	if (depth_data) {
+    // Depth
+    if (depth_data) {
         if (depth_data->left_frame) {
             delete[] depth_data->left_frame; depth_data->left_frame = nullptr;
         }
@@ -243,10 +279,10 @@ void ViveSR_DualCameraImageCapture::Release() {
         if (depth_data->camera_params) {
             delete[] depth_data->camera_params; depth_data->camera_params = nullptr;
         }
-	}
+    }
     if (pass_through_data) delete[] pass_through_data; pass_through_data = nullptr;
     if (pass_through4K_data) delete[] pass_through4K_data; pass_through4K_data = nullptr;
-    if (depth_data) delete[] depth_data; depth_data = nullptr;	
+    if (depth_data) delete[] depth_data; depth_data = nullptr;
 }
 
 void ViveSR_DualCameraImageCapture::GetParameters()
@@ -275,10 +311,10 @@ void ViveSR_DualCameraImageCapture::GetParameters()
         ViveSR::SRWork::PassThrough::GetPassThrougParameterFloat(ViveSR::PassThrough::Param::OFFSET_HEAD_TO_CAMERA_y1, &head_to_camera_offset[4]);
         ViveSR::SRWork::PassThrough::GetPassThrougParameterFloat(ViveSR::PassThrough::Param::OFFSET_HEAD_TO_CAMERA_z1, &head_to_camera_offset[5]);
     }
-    else { 
+    else {
         ViveSR::SRWork::PassThrough::SetSkipVGAProcess(true);
         ViveSR::SRWork::PassThrough4K::Get4KCameraParams(camera_params);
-        
+
         ViveSR::SRWork::PassThrough4K::GetPassThroug4KParameterInt(ViveSR::PassThrough4K::Param::OUTPUT_UNDISTORTED_4K_WIDTH, &undistorted_img_width);
         ViveSR::SRWork::PassThrough4K::GetPassThroug4KParameterInt(ViveSR::PassThrough4K::Param::OUTPUT_UNDISTORTED_4K_HEIGHT, &undistorted_img_height);
         ViveSR::SRWork::PassThrough4K::GetPassThroug4KParameterInt(ViveSR::PassThrough4K::Param::OUTPUT_DISTORTED_4K_CHANNEL, &UndistortedImageChannel);
@@ -291,40 +327,40 @@ void ViveSR_DualCameraImageCapture::GetParameters()
         ViveSR::SRWork::PassThrough4K::GetPassThroug4KParameterFloat(ViveSR::PassThrough4K::Param::OFFSET_HEAD_TO_4K_CAMERA_y1, &head_to_camera_offset[4]);
         ViveSR::SRWork::PassThrough4K::GetPassThroug4KParameterFloat(ViveSR::PassThrough4K::Param::OFFSET_HEAD_TO_4K_CAMERA_z1, &head_to_camera_offset[5]);
     }
-	distorted_cx_left = camera_params[0];
-	distorted_cy_left = camera_params[2];
-	distorted_cx_right = camera_params[1];
-	distorted_cy_right = camera_params[3];
-	focal_length_left = camera_params[4];
-	focal_length_right = camera_params[5];
-	
+    distorted_cx_left = camera_params[0];
+    distorted_cy_left = camera_params[2];
+    distorted_cx_right = camera_params[1];
+    distorted_cy_right = camera_params[3];
+    focal_length_left = camera_params[4];
+    focal_length_right = camera_params[5];
+
     undistorted_cx_left = camera_params[18];
     undistorted_cy_left = camera_params[19];
     undistorted_cx_right = camera_params[20];
     undistorted_cy_right = camera_params[21];
 
-	ViveSR::SRWork::Depth::GetDepthParameterInt(ViveSR::Depth::Param::OUTPUT_WIDTH, & depth_img_width);
-	ViveSR::SRWork::Depth::GetDepthParameterInt(ViveSR::Depth::Param::OUTPUT_HEIGHT, &depth_img_height);
-	ViveSR::SRWork::Depth::GetDepthParameterInt(ViveSR::Depth::Param::OUTPUT_CHAANEL_1, &depth_img_channel);
-	ViveSR::SRWork::Depth::GetDepthParameterDouble(ViveSR::Depth::Param::BASELINE, &base_line);
+    ViveSR::SRWork::Depth::GetDepthParameterInt(ViveSR::Depth::Param::OUTPUT_WIDTH, &depth_img_width);
+    ViveSR::SRWork::Depth::GetDepthParameterInt(ViveSR::Depth::Param::OUTPUT_HEIGHT, &depth_img_height);
+    ViveSR::SRWork::Depth::GetDepthParameterInt(ViveSR::Depth::Param::OUTPUT_CHAANEL_1, &depth_img_channel);
+    ViveSR::SRWork::Depth::GetDepthParameterDouble(ViveSR::Depth::Param::BASELINE, &base_line);
 }
 
 ViveSR_DualCameraImageCapture* ViveSR_DualCameraImageCapture::Instance()
 {
-	if (Mgr == nullptr)
-	{
-		Mgr = new ViveSR_DualCameraImageCapture();
-	}
-	return Mgr;
+    if (Mgr == nullptr)
+    {
+        Mgr = new ViveSR_DualCameraImageCapture();
+    }
+    return Mgr;
 }
 
 void ViveSR_DualCameraImageCapture::DestroyImageCapture()
 {
-	if (Mgr != nullptr)
-	{
-		delete Mgr;
-		Mgr = nullptr;
-	}
+    if (Mgr != nullptr)
+    {
+        delete Mgr;
+        Mgr = nullptr;
+    }
 }
 
 void ViveSR_DualCameraImageCapture::GetDistortedTexture(UTexture2D*& img_left, UTexture2D*& img_right, int& frame_idx, int& time_idx)
@@ -335,10 +371,86 @@ void ViveSR_DualCameraImageCapture::GetDistortedTexture(UTexture2D*& img_left, U
             distorted_texture_right->UpdateTextureRegions(0, 1, distorted_texture_region, static_cast<uint32>(distorted_img_width * sizeof(uint8) * 4), sizeof(uint8) * 4, distorted_raw_bgra_right, texCleanUpFP);
         }
         else {
-            if (get_PassThrough_result == 0) {
-                FlushRenderingCommands();
-                device_context->CopyResource((ID3D11Texture2D*)distorted_texture_right->Resource->TextureRHI->GetTexture2D()->GetNativeResource(), (ID3D11Texture2D*)resource_from_handle_right[idx_map[pass_through_data->d3d11_texture2d_buffer_index]]);
-                device_context->CopyResource((ID3D11Texture2D*)distorted_texture_left->Resource->TextureRHI->GetTexture2D()->GetNativeResource(), (ID3D11Texture2D*)resource_from_handle_left[idx_map[pass_through_data->d3d11_texture2d_buffer_index]]);
+            FString RHIName = GDynamicRHI->GetName();
+            if (RHIName == TEXT("D3D11")) {
+                if (get_PassThrough_result == 0) {
+                    FlushRenderingCommands();
+                    device_context->CopyResource(
+                        (ID3D11Texture2D*)distorted_texture_right->GetResource()->TextureRHI->GetTexture2D()->GetNativeResource(),
+                        (ID3D11Texture2D*)resource_from_handle_right[idx_map[pass_through_data->d3d11_texture2d_buffer_index]]);
+                    device_context->CopyResource(
+                        (ID3D11Texture2D*)distorted_texture_left->GetResource()->TextureRHI->GetTexture2D()->GetNativeResource(),
+                        (ID3D11Texture2D*)resource_from_handle_left[idx_map[pass_through_data->d3d11_texture2d_buffer_index]]);
+                }
+            }
+            else if (RHIName == TEXT("D3D12")) {
+                // D3D12 GPU path
+                HANDLE shared_handle_left = *(HANDLE*)pass_through_data->d3d11_texture2d_shared_handle_left;
+                HANDLE shared_handle_right = *(HANDLE*)pass_through_data->d3d11_texture2d_shared_handle_right;
+
+                ComPtr<ID3D12Resource> srcResourceLeft;
+                ComPtr<ID3D12Resource> srcResourceRight;
+                HRESULT hrL = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_left, __uuidof(ID3D12Resource), (void**)&srcResourceLeft);
+                HRESULT hrR = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_right, __uuidof(ID3D12Resource), (void**)&srcResourceRight);
+
+                if (FAILED(hrL) || FAILED(hrR) || !srcResourceLeft || !srcResourceRight) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 OpenSharedHandle failed for GetDistortedTexture."));
+                    return;
+                }
+
+                ID3D12Resource* dstResourceLeft = (ID3D12Resource*)distorted_texture_left->GetResource()->TextureRHI->GetNativeResource();
+                ID3D12Resource* dstResourceRight = (ID3D12Resource*)distorted_texture_right->GetResource()->TextureRHI->GetNativeResource();
+
+                ComPtr<ID3D12CommandAllocator> cmdAllocator;
+                ComPtr<ID3D12GraphicsCommandList> cmdList;
+                hrL = ((ID3D12Device*)native_device)->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAllocator));
+                hrR = ((ID3D12Device*)native_device)->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAllocator.Get(), nullptr, IID_PPV_ARGS(&cmdList));
+                if (FAILED(hrL) || FAILED(hrR)) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 CreateCommandList failed for GetDistortedTexture."));
+                    return;
+                }
+
+                D3D12_RESOURCE_BARRIER barriers[2] = {};
+                barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[0].Transition.pResource = srcResourceLeft.Get();
+                barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[1].Transition.pResource = dstResourceLeft;
+                barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceLeft, srcResourceLeft.Get());
+
+                barriers[0].Transition.pResource = srcResourceRight.Get();
+                barriers[1].Transition.pResource = dstResourceRight;
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceRight, srcResourceRight.Get());
+
+                std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+                std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+                cmdList->ResourceBarrier(2, barriers);
+
+                cmdList->Close();
+                ID3D12CommandList* lists[] = { cmdList.Get() };
+                ID3D12CommandQueue* cmdQueue = CreateD3D12CommandQueue((ID3D12Device*)native_device);
+                cmdQueue->ExecuteCommandLists(1, lists);
+
+                ComPtr<ID3D12Fence> fence;
+                UINT64 fenceValue = 1;
+                ((ID3D12Device*)native_device)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                cmdQueue->Signal(fence.Get(), fenceValue);
+                if (fence->GetCompletedValue() < fenceValue) {
+                    HANDLE eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                    fence->SetEventOnCompletion(fenceValue, eventHandle);
+                    WaitForSingleObject(eventHandle, INFINITE);
+                    CloseHandle(eventHandle);
+                }
+                ReleaseD3D12CommandQueue(cmdQueue);
             }
         }
         frame_idx = pass_through_data->frameSeq;
@@ -350,36 +462,186 @@ void ViveSR_DualCameraImageCapture::GetDistortedTexture(UTexture2D*& img_left, U
             distorted_texture_right->UpdateTextureRegions(0, 1, distorted_texture_region, static_cast<uint32>(distorted_img_width * sizeof(uint8) * 4), sizeof(uint8) * 4, distorted_raw_bgra_right, texCleanUpFP);
         }
         else {
-            if (get_PassThrough_result == 0) {
-                FlushRenderingCommands();
-                device_context->CopyResource((ID3D11Texture2D*)distorted_texture_left->Resource->TextureRHI->GetTexture2D()->GetNativeResource(), (ID3D11Texture2D*)resource_from_handle_left[idx_map[pass_through4K_data->d3d11_texture2d_buffer_index]]);
-                device_context->CopyResource((ID3D11Texture2D*)distorted_texture_right->Resource->TextureRHI->GetTexture2D()->GetNativeResource(), (ID3D11Texture2D*)resource_from_handle_right[idx_map[pass_through4K_data->d3d11_texture2d_buffer_index]]);
+            FString RHIName = GDynamicRHI->GetName();
+            if (RHIName == TEXT("D3D11")) {
+                if (get_PassThrough_result == 0) {
+                    FlushRenderingCommands();
+                    device_context->CopyResource(
+                        (ID3D11Texture2D*)distorted_texture_left->GetResource()->TextureRHI->GetTexture2D()->GetNativeResource(),
+                        (ID3D11Texture2D*)resource_from_handle_left[idx_map[pass_through4K_data->d3d11_texture2d_buffer_index]]);
+                    device_context->CopyResource(
+                        (ID3D11Texture2D*)distorted_texture_right->GetResource()->TextureRHI->GetTexture2D()->GetNativeResource(),
+                        (ID3D11Texture2D*)resource_from_handle_right[idx_map[pass_through4K_data->d3d11_texture2d_buffer_index]]);
+                }
+            }
+            else if (RHIName == TEXT("D3D12")) {
+                HANDLE shared_handle_left = *(HANDLE*)pass_through4K_data->d3d11_texture2d_shared_handle_left;
+                HANDLE shared_handle_right = *(HANDLE*)pass_through4K_data->d3d11_texture2d_shared_handle_right;
+
+                ComPtr<ID3D12Resource> srcResourceLeft;
+                ComPtr<ID3D12Resource> srcResourceRight;
+                HRESULT hrL = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_left, __uuidof(ID3D12Resource), (void**)&srcResourceLeft);
+                HRESULT hrR = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_right, __uuidof(ID3D12Resource), (void**)&srcResourceRight);
+
+                if (FAILED(hrL) || FAILED(hrR) || !srcResourceLeft || !srcResourceRight) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 OpenSharedHandle failed for GetDistortedTexture (4K)."));
+                    return;
+                }
+
+                ID3D12Resource* dstResourceLeft = (ID3D12Resource*)distorted_texture_left->GetResource()->TextureRHI->GetNativeResource();
+                ID3D12Resource* dstResourceRight = (ID3D12Resource*)distorted_texture_right->GetResource()->TextureRHI->GetNativeResource();
+
+                ComPtr<ID3D12CommandAllocator> cmdAllocator;
+                ComPtr<ID3D12GraphicsCommandList> cmdList;
+                hrL = ((ID3D12Device*)native_device)->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAllocator));
+                hrR = ((ID3D12Device*)native_device)->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAllocator.Get(), nullptr, IID_PPV_ARGS(&cmdList));
+                if (FAILED(hrL) || FAILED(hrR)) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 CreateCommandList failed for GetDistortedTexture (4K)."));
+                    return;
+                }
+
+                D3D12_RESOURCE_BARRIER barriers[2] = {};
+                barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[0].Transition.pResource = srcResourceLeft.Get();
+                barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[1].Transition.pResource = dstResourceLeft;
+                barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceLeft, srcResourceLeft.Get());
+
+                barriers[0].Transition.pResource = srcResourceRight.Get();
+                barriers[1].Transition.pResource = dstResourceRight;
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceRight, srcResourceRight.Get());
+
+                std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+                std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+                cmdList->ResourceBarrier(2, barriers);
+
+                cmdList->Close();
+                ID3D12CommandList* lists[] = { cmdList.Get() };
+                ID3D12CommandQueue* cmdQueue = CreateD3D12CommandQueue((ID3D12Device*)native_device);
+                cmdQueue->ExecuteCommandLists(1, lists);
+
+                ComPtr<ID3D12Fence> fence;
+                UINT64 fenceValue = 1;
+                ((ID3D12Device*)native_device)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                cmdQueue->Signal(fence.Get(), fenceValue);
+                if (fence->GetCompletedValue() < fenceValue) {
+                    HANDLE eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                    fence->SetEventOnCompletion(fenceValue, eventHandle);
+                    WaitForSingleObject(eventHandle, INFINITE);
+                    CloseHandle(eventHandle);
+                }
+                ReleaseD3D12CommandQueue(cmdQueue);
             }
         }
         frame_idx = pass_through4K_data->output4k_frameSeq;
         time_idx = pass_through4K_data->output4k_timeStp;
     }
 
-	img_left = distorted_texture_left;
-	img_right = distorted_texture_right;
+    img_left = distorted_texture_left;
+    img_right = distorted_texture_right;
 }
 
 void ViveSR_DualCameraImageCapture::GetUndistortedTexture(UTexture2D*& img_left, UTexture2D*& img_right, int& frame_idx, int& time_idx)
 {
-    if (!img4K_ready) {       
+    if (!img4K_ready) {
         if (!is_gpu_path) {
             undistorted_texture_left->UpdateTextureRegions(0, 1, undistorted_texture_region, static_cast<uint32>(undistorted_img_width * sizeof(uint8) * 4), sizeof(uint8) * 4, undistorted_raw_bgra_left, texCleanUpFP);
             undistorted_texture_right->UpdateTextureRegions(0, 1, undistorted_texture_region, static_cast<uint32>(undistorted_img_width * sizeof(uint8) * 4), sizeof(uint8) * 4, undistorted_raw_bgra_right, texCleanUpFP);
-        }        
+        }
         else {
-            if (get_PassThrough_result == 0) {
-               FlushRenderingCommands();
-               device_context->CopyResource((ID3D11Texture2D*)undistorted_texture_right->Resource->TextureRHI->GetTexture2D()->GetNativeResource(), (ID3D11Texture2D*)resource_from_handle_right[idx_map[pass_through_data->d3d11_texture2d_buffer_index]]);
-               device_context->CopyResource((ID3D11Texture2D*)undistorted_texture_left->Resource->TextureRHI->GetTexture2D()->GetNativeResource(), (ID3D11Texture2D*)resource_from_handle_left[idx_map[pass_through_data->d3d11_texture2d_buffer_index]]);
+            FString RHIName = GDynamicRHI->GetName();
+            if (RHIName == TEXT("D3D11")) {
+                if (get_PassThrough_result == 0) {
+                    FlushRenderingCommands();
+                    device_context->CopyResource(
+                        (ID3D11Texture2D*)undistorted_texture_right->GetResource()->TextureRHI->GetTexture2D()->GetNativeResource(),
+                        (ID3D11Texture2D*)resource_from_handle_right[idx_map[pass_through_data->d3d11_texture2d_buffer_index]]);
+                    device_context->CopyResource(
+                        (ID3D11Texture2D*)undistorted_texture_left->GetResource()->TextureRHI->GetTexture2D()->GetNativeResource(),
+                        (ID3D11Texture2D*)resource_from_handle_left[idx_map[pass_through_data->d3d11_texture2d_buffer_index]]);
+                }
+            }
+            else if (RHIName == TEXT("D3D12")) {
+                HANDLE shared_handle_left = *(HANDLE*)pass_through_data->d3d11_texture2d_shared_handle_left;
+                HANDLE shared_handle_right = *(HANDLE*)pass_through_data->d3d11_texture2d_shared_handle_right;
+
+                ComPtr<ID3D12Resource> srcResourceLeft;
+                ComPtr<ID3D12Resource> srcResourceRight;
+                HRESULT hrL = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_left, __uuidof(ID3D12Resource), (void**)&srcResourceLeft);
+                HRESULT hrR = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_right, __uuidof(ID3D12Resource), (void**)&srcResourceRight);
+
+                if (FAILED(hrL) || FAILED(hrR) || !srcResourceLeft || !srcResourceRight) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 OpenSharedHandle failed for GetUndistortedTexture."));
+                    return;
+                }
+
+                ID3D12Resource* dstResourceLeft = (ID3D12Resource*)undistorted_texture_left->GetResource()->TextureRHI->GetNativeResource();
+                ID3D12Resource* dstResourceRight = (ID3D12Resource*)undistorted_texture_right->GetResource()->TextureRHI->GetNativeResource();
+
+                ComPtr<ID3D12CommandAllocator> cmdAllocator;
+                ComPtr<ID3D12GraphicsCommandList> cmdList;
+                hrL = ((ID3D12Device*)native_device)->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAllocator));
+                hrR = ((ID3D12Device*)native_device)->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAllocator.Get(), nullptr, IID_PPV_ARGS(&cmdList));
+                if (FAILED(hrL) || FAILED(hrR)) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 CreateCommandList failed for GetUndistortedTexture."));
+                    return;
+                }
+
+                D3D12_RESOURCE_BARRIER barriers[2] = {};
+                barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[0].Transition.pResource = srcResourceLeft.Get();
+                barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[1].Transition.pResource = dstResourceLeft;
+                barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceLeft, srcResourceLeft.Get());
+
+                barriers[0].Transition.pResource = srcResourceRight.Get();
+                barriers[1].Transition.pResource = dstResourceRight;
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceRight, srcResourceRight.Get());
+
+                std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+                std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+                cmdList->ResourceBarrier(2, barriers);
+
+                cmdList->Close();
+                ID3D12CommandList* lists[] = { cmdList.Get() };
+                ID3D12CommandQueue* cmdQueue = CreateD3D12CommandQueue((ID3D12Device*)native_device);
+                cmdQueue->ExecuteCommandLists(1, lists);
+
+                ComPtr<ID3D12Fence> fence;
+                UINT64 fenceValue = 1;
+                ((ID3D12Device*)native_device)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                cmdQueue->Signal(fence.Get(), fenceValue);
+                if (fence->GetCompletedValue() < fenceValue) {
+                    HANDLE eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                    fence->SetEventOnCompletion(fenceValue, eventHandle);
+                    WaitForSingleObject(eventHandle, INFINITE);
+                    CloseHandle(eventHandle);
+                }
+                ReleaseD3D12CommandQueue(cmdQueue);
             }
         }
         frame_idx = pass_through_data->frameSeq;
-        time_idx = pass_through_data->timeStp;    
+        time_idx = pass_through_data->timeStp;
     }
     else {
         if (!is_gpu_path) {
@@ -387,10 +649,85 @@ void ViveSR_DualCameraImageCapture::GetUndistortedTexture(UTexture2D*& img_left,
             undistorted_texture_right->UpdateTextureRegions(0, 1, undistorted_texture_region, static_cast<uint32>(undistorted_img_width * sizeof(uint8) * 4), sizeof(uint8) * 4, undistorted_raw_bgra_right, texCleanUpFP);
         }
         else {
-            if (get_PassThrough_result == 0) {
-                FlushRenderingCommands();
-                device_context->CopyResource((ID3D11Texture2D*)undistorted_texture_left->Resource->TextureRHI->GetTexture2D()->GetNativeResource(), (ID3D11Texture2D*)resource_from_handle_left[idx_map[pass_through4K_data->d3d11_texture2d_buffer_index]]);
-                device_context->CopyResource((ID3D11Texture2D*)undistorted_texture_right->Resource->TextureRHI->GetTexture2D()->GetNativeResource(), (ID3D11Texture2D*)resource_from_handle_right[idx_map[pass_through4K_data->d3d11_texture2d_buffer_index]]);
+            FString RHIName = GDynamicRHI->GetName();
+            if (RHIName == TEXT("D3D11")) {
+                if (get_PassThrough_result == 0) {
+                    FlushRenderingCommands();
+                    device_context->CopyResource(
+                        (ID3D11Texture2D*)undistorted_texture_left->GetResource()->TextureRHI->GetTexture2D()->GetNativeResource(),
+                        (ID3D11Texture2D*)resource_from_handle_left[idx_map[pass_through4K_data->d3d11_texture2d_buffer_index]]);
+                    device_context->CopyResource(
+                        (ID3D11Texture2D*)undistorted_texture_right->GetResource()->TextureRHI->GetTexture2D()->GetNativeResource(),
+                        (ID3D11Texture2D*)resource_from_handle_right[idx_map[pass_through4K_data->d3d11_texture2d_buffer_index]]);
+                }
+            }
+            else if (RHIName == TEXT("D3D12")) {
+                HANDLE shared_handle_left = *(HANDLE*)pass_through4K_data->d3d11_texture2d_shared_handle_left;
+                HANDLE shared_handle_right = *(HANDLE*)pass_through4K_data->d3d11_texture2d_shared_handle_right;
+
+                ComPtr<ID3D12Resource> srcResourceLeft;
+                ComPtr<ID3D12Resource> srcResourceRight;
+                HRESULT hrL = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_left, __uuidof(ID3D12Resource), (void**)&srcResourceLeft);
+                HRESULT hrR = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_right, __uuidof(ID3D12Resource), (void**)&srcResourceRight);
+
+                if (FAILED(hrL) || FAILED(hrR) || !srcResourceLeft || !srcResourceRight) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 OpenSharedHandle failed for GetUndistortedTexture (4K)."));
+                    return;
+                }
+
+                ID3D12Resource* dstResourceLeft = (ID3D12Resource*)undistorted_texture_left->GetResource()->TextureRHI->GetNativeResource();
+                ID3D12Resource* dstResourceRight = (ID3D12Resource*)undistorted_texture_right->GetResource()->TextureRHI->GetNativeResource();
+
+                ComPtr<ID3D12CommandAllocator> cmdAllocator;
+                ComPtr<ID3D12GraphicsCommandList> cmdList;
+                hrL = ((ID3D12Device*)native_device)->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAllocator));
+                hrR = ((ID3D12Device*)native_device)->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAllocator.Get(), nullptr, IID_PPV_ARGS(&cmdList));
+                if (FAILED(hrL) || FAILED(hrR)) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 CreateCommandList failed for GetUndistortedTexture (4K)."));
+                    return;
+                }
+
+                D3D12_RESOURCE_BARRIER barriers[2] = {};
+                barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[0].Transition.pResource = srcResourceLeft.Get();
+                barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[1].Transition.pResource = dstResourceLeft;
+                barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceLeft, srcResourceLeft.Get());
+
+                barriers[0].Transition.pResource = srcResourceRight.Get();
+                barriers[1].Transition.pResource = dstResourceRight;
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceRight, srcResourceRight.Get());
+
+                std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+                std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+                cmdList->ResourceBarrier(2, barriers);
+
+                cmdList->Close();
+                ID3D12CommandList* lists[] = { cmdList.Get() };
+                ID3D12CommandQueue* cmdQueue = CreateD3D12CommandQueue((ID3D12Device*)native_device);
+                cmdQueue->ExecuteCommandLists(1, lists);
+
+                ComPtr<ID3D12Fence> fence;
+                UINT64 fenceValue = 1;
+                ((ID3D12Device*)native_device)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                cmdQueue->Signal(fence.Get(), fenceValue);
+                if (fence->GetCompletedValue() < fenceValue) {
+                    HANDLE eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                    fence->SetEventOnCompletion(fenceValue, eventHandle);
+                    WaitForSingleObject(eventHandle, INFINITE);
+                    CloseHandle(eventHandle);
+                }
+                ReleaseD3D12CommandQueue(cmdQueue);
             }
         }
         frame_idx = pass_through4K_data->output4k_frameSeq;
@@ -398,15 +735,14 @@ void ViveSR_DualCameraImageCapture::GetUndistortedTexture(UTexture2D*& img_left,
     }
     img_left = undistorted_texture_left;
     img_right = undistorted_texture_right;
-
 }
 
 void ViveSR_DualCameraImageCapture::GetDepthTexture(UTexture2D*& imageDepth, int& frame_idx, int& time_idx)
 {
-	depth_texture->UpdateTextureRegions(0, 1, depth_texture_region, static_cast<uint32>(depth_img_width * sizeof(float) * depth_img_channel), sizeof(float), depth_raw, texCleanUpFP);
-	imageDepth = depth_texture;
-	frame_idx = depth_data->frame_seq;
-	time_idx = depth_data->time_stp;
+    depth_texture->UpdateTextureRegions(0, 1, depth_texture_region, static_cast<uint32>(depth_img_width * sizeof(float) * depth_img_channel), sizeof(float), depth_raw, texCleanUpFP);
+    imageDepth = depth_texture;
+    frame_idx = depth_data->frame_seq;
+    time_idx = depth_data->time_stp;
 }
 
 bool ViveSR_DualCameraImageCapture::UpdateDistortedImage()
@@ -418,36 +754,124 @@ bool ViveSR_DualCameraImageCapture::UpdateDistortedImage()
             return false;
         }
         if (!is_gpu_path) {
-            int length = 0;
-            length = distorted_img_width * distorted_img_height * distorted_img_channel;
+            int length = distorted_img_width * distorted_img_height * distorted_img_channel;
             memcpy(distorted_raw_bgra_left, pass_through_data->distorted_frame_left, length);
             memcpy(distorted_raw_bgra_right, pass_through_data->distorted_frame_right, length);
         }
-
         else {
-            int buffer_idx = pass_through_data->d3d11_texture2d_buffer_index;
-            if (!idx_map.Contains(buffer_idx)) {
-                idx_map.Add(buffer_idx, vertex_idx);
-                vertex_idx++;
-                srv_left.resize(srv_left.size() + 1);
-                srv_right.resize(srv_right.size() + 1);
+            FString RHIName = GDynamicRHI->GetName();
+            if (RHIName == TEXT("D3D11")) {
+                int buffer_idx = pass_through_data->d3d11_texture2d_buffer_index;
+                if (!idx_map.Contains(buffer_idx)) {
+                    idx_map.Add(buffer_idx, vertex_idx);
+                    vertex_idx++;
+                    srv_left.resize(srv_left.size() + 1);
+                    srv_right.resize(srv_right.size() + 1);
 
-                resource_from_handle_left.resize(resource_from_handle_left.size() + 1);
-                resource_from_handle_right.resize(resource_from_handle_right.size() + 1);
+                    resource_from_handle_left.resize(resource_from_handle_left.size() + 1);
+                    resource_from_handle_right.resize(resource_from_handle_right.size() + 1);
 
+                    if (!GetD3D11ShaderResourceView((void*)pass_through_data->d3d11_texture2d_shared_handle_left, &srv_left[idx_map[buffer_idx]])) {
+                        idx_map.Remove(buffer_idx);
+                        return false;
+                    }
+                    if (!GetD3D11ShaderResourceView((void*)pass_through_data->d3d11_texture2d_shared_handle_right, &srv_right[idx_map[buffer_idx]])) {
+                        idx_map.Remove(buffer_idx);
+                        return false;
+                    }
+                    srv_from_handle_left = (ID3D11ShaderResourceView*)srv_left[idx_map[buffer_idx]];
+                    srv_from_handle_left->GetResource(&resource_from_handle_left[idx_map[buffer_idx]]);
+                    srv_from_handle_right = (ID3D11ShaderResourceView*)srv_right[idx_map[buffer_idx]];
+                    srv_from_handle_right->GetResource(&resource_from_handle_right[idx_map[buffer_idx]]);
+                }
+            }
+            else if (RHIName == TEXT("D3D12")) {
+                int buffer_idx = pass_through_data->d3d11_texture2d_buffer_index;
+                if (!idx_map.Contains(buffer_idx)) {
+                    idx_map.Add(buffer_idx, vertex_idx);
+                    vertex_idx++;
+                    srv_left.resize(srv_left.size() + 1);
+                    srv_right.resize(srv_right.size() + 1);
+                    // For D3D12, GetD3D11ShaderResourceView creates a descriptor heap, but for copy we need the resource
+                    GetD3D11ShaderResourceView((void*)pass_through_data->d3d11_texture2d_shared_handle_left, &srv_left[idx_map[buffer_idx]]);
+                    GetD3D11ShaderResourceView((void*)pass_through_data->d3d11_texture2d_shared_handle_right, &srv_right[idx_map[buffer_idx]]);
+                }
 
-                if (!GetD3D11ShaderResourceView((void*)pass_through_data->d3d11_texture2d_shared_handle_left, &srv_left[idx_map[buffer_idx]])){
-                    idx_map.Remove(buffer_idx);
+                // Open shared handles for left and right
+                HANDLE shared_handle_left = *(HANDLE*)pass_through_data->d3d11_texture2d_shared_handle_left;
+                HANDLE shared_handle_right = *(HANDLE*)pass_through_data->d3d11_texture2d_shared_handle_right;
+
+                ComPtr<ID3D12Resource> srcResourceLeft;
+                ComPtr<ID3D12Resource> srcResourceRight;
+                HRESULT hrL = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_left, __uuidof(ID3D12Resource), (void**)&srcResourceLeft);
+                HRESULT hrR = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_right, __uuidof(ID3D12Resource), (void**)&srcResourceRight);
+
+                if (FAILED(hrL) || FAILED(hrR) || !srcResourceLeft || !srcResourceRight) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 OpenSharedHandle failed for UpdateDistortedImage."));
                     return false;
                 }
-                if (!GetD3D11ShaderResourceView((void*)pass_through_data->d3d11_texture2d_shared_handle_right, &srv_right[idx_map[buffer_idx]])) {
-                    idx_map.Remove(buffer_idx);
+
+                ID3D12Resource* dstResourceLeft = (ID3D12Resource*)distorted_texture_left->GetResource()->TextureRHI->GetNativeResource();
+                ID3D12Resource* dstResourceRight = (ID3D12Resource*)distorted_texture_right->GetResource()->TextureRHI->GetNativeResource();
+
+                // Create command allocator and command list
+                ComPtr<ID3D12CommandAllocator> cmdAllocator;
+                ComPtr<ID3D12GraphicsCommandList> cmdList;
+                hrL = ((ID3D12Device*)native_device)->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAllocator));
+                hrR = ((ID3D12Device*)native_device)->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAllocator.Get(), nullptr, IID_PPV_ARGS(&cmdList));
+                if (FAILED(hrL) || FAILED(hrR)) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 CreateCommandList failed for UpdateDistortedImage."));
                     return false;
                 }
-                srv_from_handle_left = (ID3D11ShaderResourceView*)srv_left[idx_map[buffer_idx]];
-                srv_from_handle_left->GetResource(&resource_from_handle_left[idx_map[buffer_idx]]);
-                srv_from_handle_right = (ID3D11ShaderResourceView*)srv_right[idx_map[buffer_idx]];
-                srv_from_handle_right->GetResource(&resource_from_handle_right[idx_map[buffer_idx]]);
+
+                // Transition resources to COPY_SOURCE and COPY_DEST
+                D3D12_RESOURCE_BARRIER barriers[2] = {};
+                barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[0].Transition.pResource = srcResourceLeft.Get();
+                barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[1].Transition.pResource = dstResourceLeft;
+                barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                cmdList->ResourceBarrier(2, barriers);
+
+                // Copy left
+                cmdList->CopyResource(dstResourceLeft, srcResourceLeft.Get());
+
+                // Repeat for right
+                barriers[0].Transition.pResource = srcResourceRight.Get();
+                barriers[1].Transition.pResource = dstResourceRight;
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceRight, srcResourceRight.Get());
+
+                // Transition back to COMMON
+                std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+                std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+                cmdList->ResourceBarrier(2, barriers);
+
+                // Close and execute
+                cmdList->Close();
+                ID3D12CommandList* lists[] = { cmdList.Get() };
+                ID3D12CommandQueue* cmdQueue = CreateD3D12CommandQueue((ID3D12Device*)native_device);
+                cmdQueue->ExecuteCommandLists(1, lists);
+
+                // Wait for completion (fence)
+                ComPtr<ID3D12Fence> fence;
+                UINT64 fenceValue = 1;
+                ((ID3D12Device*)native_device)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                cmdQueue->Signal(fence.Get(), fenceValue);
+                if (fence->GetCompletedValue() < fenceValue) {
+                    HANDLE eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                    fence->SetEventOnCompletion(fenceValue, eventHandle);
+                    WaitForSingleObject(eventHandle, INFINITE);
+                    CloseHandle(eventHandle);
+                }
+                ReleaseD3D12CommandQueue(cmdQueue);
             }
         }
 
@@ -463,42 +887,121 @@ bool ViveSR_DualCameraImageCapture::UpdateDistortedImage()
             FPlane(pass_through_data->pose_right[3], pass_through_data->pose_right[7], pass_through_data->pose_right[11], pass_through_data->pose_right[15]));
     }
     else {
-        get_PassThrough_result = ViveSR::SRWork::PassThrough4K::GetPassThrough4KData(pass_through4K_data);    
+        get_PassThrough_result = ViveSR::SRWork::PassThrough4K::GetPassThrough4KData(pass_through4K_data);
         if (get_PassThrough_result != 0) {
             UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetPassThrough4K Data %d"), get_PassThrough_result);
             return false;
-
         }
         if (!is_gpu_path) {
-            int length = 0;
-            length = distorted_img_width * distorted_img_height * distorted_img_channel;
+            int length = distorted_img_width * distorted_img_height * distorted_img_channel;
             memcpy(distorted_raw_bgra_left, pass_through4K_data->distorted_4k_frame_left, length);
             memcpy(distorted_raw_bgra_right, pass_through4K_data->distorted_4k_frame_right, length);
         }
-
         else {
-            int buffer_idx = pass_through4K_data->d3d11_texture2d_buffer_index;
-            if (!idx_map.Contains(buffer_idx)) {
-                idx_map.Add(buffer_idx, vertex_idx);
-                vertex_idx++;
-                srv_left.resize(srv_left.size() + 1);
-                srv_right.resize(srv_right.size() + 1);
+            FString RHIName = GDynamicRHI->GetName();
+            if (RHIName == TEXT("D3D11")) {
+                int buffer_idx = pass_through4K_data->d3d11_texture2d_buffer_index;
+                if (!idx_map.Contains(buffer_idx)) {
+                    idx_map.Add(buffer_idx, vertex_idx);
+                    vertex_idx++;
+                    srv_left.resize(srv_left.size() + 1);
+                    srv_right.resize(srv_right.size() + 1);
 
-                resource_from_handle_left.resize(resource_from_handle_left.size() + 1);
-                resource_from_handle_right.resize(resource_from_handle_right.size() + 1);
+                    resource_from_handle_left.resize(resource_from_handle_left.size() + 1);
+                    resource_from_handle_right.resize(resource_from_handle_right.size() + 1);
 
-                if (!GetD3D11ShaderResourceView((void*)pass_through4K_data->d3d11_texture2d_shared_handle_left, &srv_left[idx_map[buffer_idx]])) {
-                    idx_map.Remove(buffer_idx);
+                    if (!GetD3D11ShaderResourceView((void*)pass_through4K_data->d3d11_texture2d_shared_handle_left, &srv_left[idx_map[buffer_idx]])) {
+                        idx_map.Remove(buffer_idx);
+                        return false;
+                    }
+                    if (!GetD3D11ShaderResourceView((void*)pass_through4K_data->d3d11_texture2d_shared_handle_right, &srv_right[idx_map[buffer_idx]])) {
+                        idx_map.Remove(buffer_idx);
+                        return false;
+                    }
+                    srv_from_handle_left = (ID3D11ShaderResourceView*)srv_left[idx_map[buffer_idx]];
+                    srv_from_handle_left->GetResource(&resource_from_handle_left[idx_map[buffer_idx]]);
+                    srv_from_handle_right = (ID3D11ShaderResourceView*)srv_right[idx_map[buffer_idx]];
+                    srv_from_handle_right->GetResource(&resource_from_handle_right[idx_map[buffer_idx]]);
+                }
+            }
+            else if (RHIName == TEXT("D3D12")) {
+                int buffer_idx = pass_through4K_data->d3d11_texture2d_buffer_index;
+                if (!idx_map.Contains(buffer_idx)) {
+                    idx_map.Add(buffer_idx, vertex_idx);
+                    vertex_idx++;
+                    srv_left.resize(srv_left.size() + 1);
+                    srv_right.resize(srv_right.size() + 1);
+                    GetD3D11ShaderResourceView((void*)pass_through4K_data->d3d11_texture2d_shared_handle_left, &srv_left[idx_map[buffer_idx]]);
+                    GetD3D11ShaderResourceView((void*)pass_through4K_data->d3d11_texture2d_shared_handle_right, &srv_right[idx_map[buffer_idx]]);
+                }
+
+                HANDLE shared_handle_left = *(HANDLE*)pass_through4K_data->d3d11_texture2d_shared_handle_left;
+                HANDLE shared_handle_right = *(HANDLE*)pass_through4K_data->d3d11_texture2d_shared_handle_right;
+
+                ComPtr<ID3D12Resource> srcResourceLeft;
+                ComPtr<ID3D12Resource> srcResourceRight;
+                HRESULT hrL = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_left, __uuidof(ID3D12Resource), (void**)&srcResourceLeft);
+                HRESULT hrR = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_right, __uuidof(ID3D12Resource), (void**)&srcResourceRight);
+
+                if (FAILED(hrL) || FAILED(hrR) || !srcResourceLeft || !srcResourceRight) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 OpenSharedHandle failed for UpdateDistortedImage (4K)."));
                     return false;
                 }
-                if (!GetD3D11ShaderResourceView((void*)pass_through4K_data->d3d11_texture2d_shared_handle_right, &srv_right[idx_map[buffer_idx]])) {
-                    idx_map.Remove(buffer_idx);
+
+                ID3D12Resource* dstResourceLeft = (ID3D12Resource*)distorted_texture_left->GetResource()->TextureRHI->GetNativeResource();
+                ID3D12Resource* dstResourceRight = (ID3D12Resource*)distorted_texture_right->GetResource()->TextureRHI->GetNativeResource();
+
+                ComPtr<ID3D12CommandAllocator> cmdAllocator;
+                ComPtr<ID3D12GraphicsCommandList> cmdList;
+                hrL = ((ID3D12Device*)native_device)->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAllocator));
+                hrR = ((ID3D12Device*)native_device)->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAllocator.Get(), nullptr, IID_PPV_ARGS(&cmdList));
+                if (FAILED(hrL) || FAILED(hrR)) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 CreateCommandList failed for UpdateDistortedImage (4K)."));
                     return false;
                 }
-                srv_from_handle_left = (ID3D11ShaderResourceView*)srv_left[idx_map[buffer_idx]];
-                srv_from_handle_left->GetResource(&resource_from_handle_left[idx_map[buffer_idx]]);
-                srv_from_handle_right = (ID3D11ShaderResourceView*)srv_right[idx_map[buffer_idx]];
-                srv_from_handle_right->GetResource(&resource_from_handle_right[idx_map[buffer_idx]]);
+
+                D3D12_RESOURCE_BARRIER barriers[2] = {};
+                barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[0].Transition.pResource = srcResourceLeft.Get();
+                barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[1].Transition.pResource = dstResourceLeft;
+                barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                cmdList->ResourceBarrier(2, barriers);
+
+                cmdList->CopyResource(dstResourceLeft, srcResourceLeft.Get());
+
+                barriers[0].Transition.pResource = srcResourceRight.Get();
+                barriers[1].Transition.pResource = dstResourceRight;
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceRight, srcResourceRight.Get());
+
+                std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+                std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+                cmdList->ResourceBarrier(2, barriers);
+
+                cmdList->Close();
+                ID3D12CommandList* lists[] = { cmdList.Get() };
+                ID3D12CommandQueue* cmdQueue = CreateD3D12CommandQueue((ID3D12Device*)native_device);
+                cmdQueue->ExecuteCommandLists(1, lists);
+
+                ComPtr<ID3D12Fence> fence;
+                UINT64 fenceValue = 1;
+                ((ID3D12Device*)native_device)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                cmdQueue->Signal(fence.Get(), fenceValue);
+                if (fence->GetCompletedValue() < fenceValue) {
+                    HANDLE eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                    fence->SetEventOnCompletion(fenceValue, eventHandle);
+                    WaitForSingleObject(eventHandle, INFINITE);
+                    CloseHandle(eventHandle);
+                }
+                ReleaseD3D12CommandQueue(cmdQueue);
             }
         }
         distorted_pose_left = FMatrix(
@@ -514,48 +1017,113 @@ bool ViveSR_DualCameraImageCapture::UpdateDistortedImage()
     }
     return true;
 }
-
 bool ViveSR_DualCameraImageCapture::UpdateUndistortedImage()
 {
     if (!img4K_ready) {
         get_PassThrough_result = ViveSR::SRWork::PassThrough::GetPassThroughData(pass_through_data);
-        
-
         if (get_PassThrough_result != 0) {
             UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetPassThrough Data %d"), get_PassThrough_result);
             return false;
         }
         if (!is_gpu_path) {
-            int length = 0;
-            length = undistorted_img_width * undistorted_img_height * UndistortedImageChannel;
+            int length = undistorted_img_width * undistorted_img_height * UndistortedImageChannel;
             memcpy(undistorted_raw_bgra_left, pass_through_data->undistorted_frame_left, length);
             memcpy(undistorted_raw_bgra_right, pass_through_data->undistorted_frame_right, length);
         }
-
         else {
-            int buffer_idx = pass_through_data->d3d11_texture2d_buffer_index;        
-            if (!idx_map.Contains(buffer_idx)) {
-                idx_map.Add(buffer_idx, vertex_idx);
-                vertex_idx++;
-                srv_left.resize(srv_left.size() + 1);
-                srv_right.resize(srv_right.size() + 1);
+            FString RHIName = GDynamicRHI->GetName();
+            if (RHIName == TEXT("D3D11")) {
+                int buffer_idx = pass_through_data->d3d11_texture2d_buffer_index;
+                if (!idx_map.Contains(buffer_idx)) {
+                    idx_map.Add(buffer_idx, vertex_idx);
+                    vertex_idx++;
+                    srv_left.resize(srv_left.size() + 1);
+                    srv_right.resize(srv_right.size() + 1);
 
-                resource_from_handle_left.resize(resource_from_handle_left.size() + 1);
-                resource_from_handle_right.resize(resource_from_handle_right.size() + 1);
+                    resource_from_handle_left.resize(resource_from_handle_left.size() + 1);
+                    resource_from_handle_right.resize(resource_from_handle_right.size() + 1);
 
+                    if (!GetD3D11ShaderResourceView((void*)pass_through_data->d3d11_texture2d_shared_handle_left, &srv_left[idx_map[buffer_idx]])) {
+                        idx_map.Remove(buffer_idx);
+                        return false;
+                    }
+                    if (!GetD3D11ShaderResourceView((void*)pass_through_data->d3d11_texture2d_shared_handle_right, &srv_right[idx_map[buffer_idx]])) {
+                        idx_map.Remove(buffer_idx);
+                        return false;
+                    }
+                    srv_from_handle_left = (ID3D11ShaderResourceView*)srv_left[idx_map[buffer_idx]];
+                    srv_from_handle_left->GetResource(&resource_from_handle_left[idx_map[buffer_idx]]);
+                    srv_from_handle_right = (ID3D11ShaderResourceView*)srv_right[idx_map[buffer_idx]];
+                    srv_from_handle_right->GetResource(&resource_from_handle_right[idx_map[buffer_idx]]);
+                }
+            }
+            else if (RHIName == TEXT("D3D12")) {
+                HANDLE shared_handle_left = *(HANDLE*)pass_through_data->d3d11_texture2d_shared_handle_left;
+                HANDLE shared_handle_right = *(HANDLE*)pass_through_data->d3d11_texture2d_shared_handle_right;
 
-                if (!GetD3D11ShaderResourceView((void*)pass_through_data->d3d11_texture2d_shared_handle_left, &srv_left[idx_map[buffer_idx]])) {
-                    idx_map.Remove(buffer_idx);
+                ComPtr<ID3D12Resource> srcResourceLeft;
+                ComPtr<ID3D12Resource> srcResourceRight;
+                HRESULT hrL = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_left, __uuidof(ID3D12Resource), (void**)&srcResourceLeft);
+                HRESULT hrR = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_right, __uuidof(ID3D12Resource), (void**)&srcResourceRight);
+
+                if (FAILED(hrL) || FAILED(hrR) || !srcResourceLeft || !srcResourceRight) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 OpenSharedHandle failed for UpdateUndistortedImage."));
                     return false;
                 }
-                if (!GetD3D11ShaderResourceView((void*)pass_through_data->d3d11_texture2d_shared_handle_right, &srv_right[idx_map[buffer_idx]])) {
-                    idx_map.Remove(buffer_idx);
+
+                ID3D12Resource* dstResourceLeft = (ID3D12Resource*)undistorted_texture_left->GetResource()->TextureRHI->GetNativeResource();
+                ID3D12Resource* dstResourceRight = (ID3D12Resource*)undistorted_texture_right->GetResource()->TextureRHI->GetNativeResource();
+
+                ComPtr<ID3D12CommandAllocator> cmdAllocator;
+                ComPtr<ID3D12GraphicsCommandList> cmdList;
+                hrL = ((ID3D12Device*)native_device)->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAllocator));
+                hrR = ((ID3D12Device*)native_device)->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAllocator.Get(), nullptr, IID_PPV_ARGS(&cmdList));
+                if (FAILED(hrL) || FAILED(hrR)) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 CreateCommandList failed for UpdateUndistortedImage."));
                     return false;
                 }
-                srv_from_handle_left = (ID3D11ShaderResourceView*)srv_left[idx_map[buffer_idx]];
-                srv_from_handle_left->GetResource(&resource_from_handle_left[idx_map[buffer_idx]]);
-                srv_from_handle_right = (ID3D11ShaderResourceView*)srv_right[idx_map[buffer_idx]];
-                srv_from_handle_right->GetResource(&resource_from_handle_right[idx_map[buffer_idx]]);
+
+                D3D12_RESOURCE_BARRIER barriers[2] = {};
+                barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[0].Transition.pResource = srcResourceLeft.Get();
+                barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[1].Transition.pResource = dstResourceLeft;
+                barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceLeft, srcResourceLeft.Get());
+
+                barriers[0].Transition.pResource = srcResourceRight.Get();
+                barriers[1].Transition.pResource = dstResourceRight;
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceRight, srcResourceRight.Get());
+
+                std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+                std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+                cmdList->ResourceBarrier(2, barriers);
+
+                cmdList->Close();
+                ID3D12CommandList* lists[] = { cmdList.Get() };
+                ID3D12CommandQueue* cmdQueue = CreateD3D12CommandQueue((ID3D12Device*)native_device);
+                cmdQueue->ExecuteCommandLists(1, lists);
+
+                ComPtr<ID3D12Fence> fence;
+                UINT64 fenceValue = 1;
+                ((ID3D12Device*)native_device)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                cmdQueue->Signal(fence.Get(), fenceValue);
+                if (fence->GetCompletedValue() < fenceValue) {
+                    HANDLE eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                    fence->SetEventOnCompletion(fenceValue, eventHandle);
+                    WaitForSingleObject(eventHandle, INFINITE);
+                    CloseHandle(eventHandle);
+                }
+                ReleaseD3D12CommandQueue(cmdQueue);
             }
         }
 
@@ -572,44 +1140,111 @@ bool ViveSR_DualCameraImageCapture::UpdateUndistortedImage()
     }
     else {
         get_PassThrough_result = ViveSR::SRWork::PassThrough4K::GetPassThrough4KData(pass_through4K_data);
-       
 
         if (get_PassThrough_result != 0) {
             UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetPassThrough4K Data %d"), get_PassThrough_result);
             return false;
         }
         if (!is_gpu_path) {
-            int length = 0;
-            length = undistorted_img_width * undistorted_img_height * UndistortedImageChannel;
+            int length = undistorted_img_width * undistorted_img_height * UndistortedImageChannel;
             memcpy(undistorted_raw_bgra_left, pass_through4K_data->undistorted_4k_frame_left, length);
             memcpy(undistorted_raw_bgra_right, pass_through4K_data->undistorted_4k_frame_right, length);
         }
-
         else {
-            
-            int buffer_idx = pass_through4K_data->d3d11_texture2d_buffer_index;
-            if (!idx_map.Contains(buffer_idx)) {
-                idx_map.Add(buffer_idx, vertex_idx);
-                vertex_idx++;
-                srv_left.resize(srv_left.size() + 1);
-                srv_right.resize(srv_right.size() + 1);
+            FString RHIName = GDynamicRHI->GetName();
+            if (RHIName == TEXT("D3D11")) {
+                int buffer_idx = pass_through4K_data->d3d11_texture2d_buffer_index;
+                if (!idx_map.Contains(buffer_idx)) {
+                    idx_map.Add(buffer_idx, vertex_idx);
+                    vertex_idx++;
+                    srv_left.resize(srv_left.size() + 1);
+                    srv_right.resize(srv_right.size() + 1);
 
-                resource_from_handle_left.resize(resource_from_handle_left.size() + 1);
-                resource_from_handle_right.resize(resource_from_handle_right.size() + 1);
+                    resource_from_handle_left.resize(resource_from_handle_left.size() + 1);
+                    resource_from_handle_right.resize(resource_from_handle_right.size() + 1);
 
-                if (!GetD3D11ShaderResourceView((void*)pass_through4K_data->d3d11_texture2d_shared_handle_left, &srv_left[idx_map[buffer_idx]])) {
-                    idx_map.Remove(buffer_idx);
+                    if (!GetD3D11ShaderResourceView((void*)pass_through4K_data->d3d11_texture2d_shared_handle_left, &srv_left[idx_map[buffer_idx]])) {
+                        idx_map.Remove(buffer_idx);
+                        return false;
+                    }
+                    if (!GetD3D11ShaderResourceView((void*)pass_through4K_data->d3d11_texture2d_shared_handle_right, &srv_right[idx_map[buffer_idx]])) {
+                        idx_map.Remove(buffer_idx);
+                        return false;
+                    }
+                    srv_from_handle_left = (ID3D11ShaderResourceView*)srv_left[idx_map[buffer_idx]];
+                    srv_from_handle_left->GetResource(&resource_from_handle_left[idx_map[buffer_idx]]);
+                    srv_from_handle_right = (ID3D11ShaderResourceView*)srv_right[idx_map[buffer_idx]];
+                    srv_from_handle_right->GetResource(&resource_from_handle_right[idx_map[buffer_idx]]);
+                }
+            }
+            else if (RHIName == TEXT("D3D12")) {
+                HANDLE shared_handle_left = *(HANDLE*)pass_through4K_data->d3d11_texture2d_shared_handle_left;
+                HANDLE shared_handle_right = *(HANDLE*)pass_through4K_data->d3d11_texture2d_shared_handle_right;
+
+                ComPtr<ID3D12Resource> srcResourceLeft;
+                ComPtr<ID3D12Resource> srcResourceRight;
+                HRESULT hrL = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_left, __uuidof(ID3D12Resource), (void**)&srcResourceLeft);
+                HRESULT hrR = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle_right, __uuidof(ID3D12Resource), (void**)&srcResourceRight);
+
+                if (FAILED(hrL) || FAILED(hrR) || !srcResourceLeft || !srcResourceRight) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 OpenSharedHandle failed for UpdateUndistortedImage (4K)."));
                     return false;
                 }
-                if (!GetD3D11ShaderResourceView((void*)pass_through4K_data->d3d11_texture2d_shared_handle_right, &srv_right[idx_map[buffer_idx]])) {
-                    idx_map.Remove(buffer_idx);
+
+                ID3D12Resource* dstResourceLeft = (ID3D12Resource*)undistorted_texture_left->GetResource()->TextureRHI->GetNativeResource();
+                ID3D12Resource* dstResourceRight = (ID3D12Resource*)undistorted_texture_right->GetResource()->TextureRHI->GetNativeResource();
+
+                ComPtr<ID3D12CommandAllocator> cmdAllocator;
+                ComPtr<ID3D12GraphicsCommandList> cmdList;
+                hrL = ((ID3D12Device*)native_device)->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAllocator));
+                hrR = ((ID3D12Device*)native_device)->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAllocator.Get(), nullptr, IID_PPV_ARGS(&cmdList));
+                if (FAILED(hrL) || FAILED(hrR)) {
+                    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] D3D12 CreateCommandList failed for UpdateUndistortedImage (4K)."));
                     return false;
                 }
-                srv_from_handle_left = (ID3D11ShaderResourceView*)srv_left[idx_map[buffer_idx]];
-                srv_from_handle_left->GetResource(&resource_from_handle_left[idx_map[buffer_idx]]);
-                srv_from_handle_right = (ID3D11ShaderResourceView*)srv_right[idx_map[buffer_idx]];
-                srv_from_handle_right->GetResource(&resource_from_handle_right[idx_map[buffer_idx]]);
-            }      
+
+                D3D12_RESOURCE_BARRIER barriers[2] = {};
+                barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[0].Transition.pResource = srcResourceLeft.Get();
+                barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[1].Transition.pResource = dstResourceLeft;
+                barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceLeft, srcResourceLeft.Get());
+
+                barriers[0].Transition.pResource = srcResourceRight.Get();
+                barriers[1].Transition.pResource = dstResourceRight;
+                cmdList->ResourceBarrier(2, barriers);
+                cmdList->CopyResource(dstResourceRight, srcResourceRight.Get());
+
+                std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+                std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+                cmdList->ResourceBarrier(2, barriers);
+
+                cmdList->Close();
+                ID3D12CommandList* lists[] = { cmdList.Get() };
+                ID3D12CommandQueue* cmdQueue = CreateD3D12CommandQueue((ID3D12Device*)native_device);
+                cmdQueue->ExecuteCommandLists(1, lists);
+
+                ComPtr<ID3D12Fence> fence;
+                UINT64 fenceValue = 1;
+                ((ID3D12Device*)native_device)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+                cmdQueue->Signal(fence.Get(), fenceValue);
+                if (fence->GetCompletedValue() < fenceValue) {
+                    HANDLE eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                    fence->SetEventOnCompletion(fenceValue, eventHandle);
+                    WaitForSingleObject(eventHandle, INFINITE);
+                    CloseHandle(eventHandle);
+                }
+                ReleaseD3D12CommandQueue(cmdQueue);
+            }
         }
         undistorted_pose_left = FMatrix(
             FPlane(pass_through4K_data->output4k_pose_left[0], pass_through4K_data->output4k_pose_left[4], pass_through4K_data->output4k_pose_left[8], pass_through4K_data->output4k_pose_left[12]),
@@ -621,62 +1256,111 @@ bool ViveSR_DualCameraImageCapture::UpdateUndistortedImage()
             FPlane(pass_through4K_data->output4k_pose_right[1], pass_through4K_data->output4k_pose_right[5], pass_through4K_data->output4k_pose_right[9], pass_through4K_data->output4k_pose_right[13]),
             FPlane(pass_through4K_data->output4k_pose_right[2], pass_through4K_data->output4k_pose_right[6], pass_through4K_data->output4k_pose_right[10], pass_through4K_data->output4k_pose_right[14]),
             FPlane(pass_through4K_data->output4k_pose_right[3], pass_through4K_data->output4k_pose_right[7], pass_through4K_data->output4k_pose_right[11], pass_through4K_data->output4k_pose_right[15]));
-    }	
+    }
     return true;
 }
 
 bool ViveSR_DualCameraImageCapture::UpdateDepthImage()
 {
-	int get_depth_result = ViveSR::SRWork::Depth::GetDepthData(depth_data);
+    int get_depth_result = ViveSR::SRWork::Depth::GetDepthData(depth_data);
 
-	if (get_depth_result == ViveSR::Error::WORK)
-	{
-		depth_pose = FMatrix(
-			FPlane(depth_data->pose[0], depth_data->pose[4], depth_data->pose[8], depth_data->pose[12]),
-			FPlane(depth_data->pose[1], depth_data->pose[5], depth_data->pose[9], depth_data->pose[13]),
-			FPlane(depth_data->pose[2], depth_data->pose[6], depth_data->pose[10], depth_data->pose[14]),
-			FPlane(depth_data->pose[3], depth_data->pose[7], depth_data->pose[11], depth_data->pose[15]));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] Update DEPTH Error %d"), get_depth_result);
+    if (get_depth_result == ViveSR::Error::WORK)
+    {
+        depth_pose = FMatrix(
+            FPlane(depth_data->pose[0], depth_data->pose[4], depth_data->pose[8], depth_data->pose[12]),
+            FPlane(depth_data->pose[1], depth_data->pose[5], depth_data->pose[9], depth_data->pose[13]),
+            FPlane(depth_data->pose[2], depth_data->pose[6], depth_data->pose[10], depth_data->pose[14]),
+            FPlane(depth_data->pose[3], depth_data->pose[7], depth_data->pose[11], depth_data->pose[15]));
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] Update DEPTH Error %d"), get_depth_result);
         return false;
-	}
-	int length = depth_img_width * depth_img_height * depth_img_channel * depth_data_size;
-	memcpy(depth_raw, depth_data->depth_map, length);
+    }
+    int length = depth_img_width * depth_img_height * depth_img_channel * depth_data_size;
+    memcpy(depth_raw, depth_data->depth_map, length);
     return true;
 }
 bool ViveSR_DualCameraImageCapture::GetD3D11ShaderResourceView(void* texture_shared_handle, void** shader_resource_view) {
-    if (!native_device)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("native_device is nullptr"));
-        return false;
-    }
+    FString RHIName = GDynamicRHI->GetName();
+    if (RHIName == TEXT("D3D11")) {
+        if (!native_device)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("native_device is nullptr"));
+            return false;
+        }
 
-    HANDLE* shared_handle = (HANDLE*)texture_shared_handle;
-    IDXGIResource* resource = nullptr;
-    ID3D11Texture2D* texture = nullptr;
-    ID3D11ShaderResourceView* _shader_resource_view = nullptr;
-   
-    HRESULT hr = native_device->OpenSharedResource(*shared_handle, __uuidof(ID3D11Texture2D), (void **)&resource);
-   
-    if (FAILED(hr)) {
-        UE_LOG(LogTemp, Warning, TEXT("OpenSharedResource() failed"));
+        HANDLE* shared_handle = (HANDLE*)texture_shared_handle;
+        IDXGIResource* resource = nullptr;
+        ID3D11Texture2D* texture = nullptr;
+        ID3D11ShaderResourceView* _shader_resource_view = nullptr;
+
+        HRESULT hr = ((ID3D11Device*)native_device)->OpenSharedResource(*shared_handle, __uuidof(ID3D11Texture2D), (void**)&resource);
+
+        if (FAILED(hr)) {
+            UE_LOG(LogTemp, Warning, TEXT("OpenSharedResource() failed"));
+            return false;
+        }
+        hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texture);
+        resource->Release();
+        if (FAILED(hr)) {
+            UE_LOG(LogTemp, Warning, TEXT("Get texture failed"));
+            return false;
+        }
+        hr = ((ID3D11Device*)native_device)->CreateShaderResourceView(texture, NULL, &_shader_resource_view);
+        if (FAILED(hr)) {
+            UE_LOG(LogTemp, Warning, TEXT("CreateShaderResourceView() failed"));
+            return false;
+        }
+        *shader_resource_view = (void*)_shader_resource_view;
+        return true;
+    }
+    else if (RHIName == TEXT("D3D12")) {
+        if (!native_device) {
+            UE_LOG(LogTemp, Warning, TEXT("native_device is nullptr"));
+            return false;
+        }
+        HANDLE shared_handle = *(HANDLE*)texture_shared_handle;
+        ComPtr<ID3D12Resource> d3d12Resource;
+        HRESULT hr = ((ID3D12Device*)native_device)->OpenSharedHandle(shared_handle, __uuidof(ID3D12Resource), (void**)&d3d12Resource);
+        if (FAILED(hr) || !d3d12Resource) {
+            UE_LOG(LogTemp, Warning, TEXT("OpenSharedHandle() failed for D3D12"));
+            return false;
+        }
+
+        // Create a descriptor heap for the SRV
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = 1;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+        hr = ((ID3D12Device*)native_device)->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&descriptorHeap));
+        if (FAILED(hr)) {
+            UE_LOG(LogTemp, Warning, TEXT("CreateDescriptorHeap() failed for D3D12"));
+            return false;
+        }
+
+        // Describe the SRV (assuming a 2D texture, adjust as needed)
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = d3d12Resource->GetDesc().Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = d3d12Resource->GetDesc().MipLevels;
+
+        ((ID3D12Device*)native_device)->CreateShaderResourceView(
+            d3d12Resource.Get(),
+            &srvDesc,
+            descriptorHeap->GetCPUDescriptorHandleForHeapStart()
+        );
+
+        // Return the descriptor heap pointer as the "shader_resource_view"
+        *shader_resource_view = descriptorHeap.Detach();
+        return true;
+    }
+    else {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] Unsupported RHI for GetD3D11ShaderResourceView."));
         return false;
     }
-    hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&texture);
-    resource->Release();
-    if (FAILED(hr)) {
-        UE_LOG(LogTemp, Warning, TEXT("Get texture failed"));
-        return false;
-    }
-    hr = native_device->CreateShaderResourceView(texture, NULL, &_shader_resource_view);
-    if (FAILED(hr)) {
-        UE_LOG(LogTemp, Warning, TEXT("CreateShaderResourceView() failed"));
-        return false;
-    }
-    *shader_resource_view = (void *)_shader_resource_view;
-    return true;
 }
 
 void ViveSR_DualCameraImageCapture::SetGPUMethod(bool GPUSetting) {
@@ -699,78 +1383,78 @@ float ViveSR_DualCameraImageCapture::GetGamma()
 #pragma region Utility
 FVector ViveSR_DualCameraImageCapture::Position(FMatrix m)
 {
-	return FVector(m.M[2][3], m.M[0][3], m.M[1][3]);
+    return FVector(m.M[2][3], m.M[0][3], m.M[1][3]);
 }
 FRotator ThreeAxisRot(double r11, double r12, double r21, double r31, double r32)
 {
-	return FRotator(atan2(r31, r32), asin(r21), atan2(r11, r12));
+    return FRotator(atan2(r31, r32), asin(r21), atan2(r11, r12));
 }
 FRotator Quaternion2Euler(FQuat q)
 {
-	return ThreeAxisRot(-2 * (q.X*q.Y - q.W*q.Z),
-		q.W*q.W - q.X*q.X + q.Y*q.Y - q.Z*q.Z,
-		2 * (q.Y*q.Z + q.W*q.X),
-		-2 * (q.X*q.Z - q.W*q.Y),
-		q.W*q.W - q.X*q.X - q.Y*q.Y + q.Z*q.Z);
+    return ThreeAxisRot(-2 * (q.X * q.Y - q.W * q.Z),
+        q.W * q.W - q.X * q.X + q.Y * q.Y - q.Z * q.Z,
+        2 * (q.Y * q.Z + q.W * q.X),
+        -2 * (q.X * q.Z - q.W * q.Y),
+        q.W * q.W - q.X * q.X - q.Y * q.Y + q.Z * q.Z);
 }
 FRotator FMatrixToRotator(FMatrix pose)
 {
-	if (!((FMath::Abs(1.f - pose.GetScaledAxis(EAxis::X).SizeSquared()) <= KINDA_SMALL_NUMBER) && (FMath::Abs(1.f - pose.GetScaledAxis(EAxis::Y).SizeSquared()) <= KINDA_SMALL_NUMBER) && (FMath::Abs(1.f - pose.GetScaledAxis(EAxis::Z).SizeSquared()) <= KINDA_SMALL_NUMBER)))
-	{
-		pose.RemoveScaling(KINDA_SMALL_NUMBER);
-	}
-	FQuat Orientation(pose);
-	FRotator ZXY = Quaternion2Euler(Orientation);
-	return FRotator(FMath::RadiansToDegrees(ZXY.Yaw),
-		-FMath::RadiansToDegrees(ZXY.Pitch),
-		FMath::RadiansToDegrees(ZXY.Roll));
+    if (!((FMath::Abs(1.f - pose.GetScaledAxis(EAxis::X).SizeSquared()) <= KINDA_SMALL_NUMBER) && (FMath::Abs(1.f - pose.GetScaledAxis(EAxis::Y).SizeSquared()) <= KINDA_SMALL_NUMBER) && (FMath::Abs(1.f - pose.GetScaledAxis(EAxis::Z).SizeSquared()) <= KINDA_SMALL_NUMBER)))
+    {
+        pose.RemoveScaling(KINDA_SMALL_NUMBER);
+    }
+    FQuat Orientation(pose);
+    FRotator ZXY = Quaternion2Euler(Orientation);
+    return FRotator(FMath::RadiansToDegrees(ZXY.Yaw),
+        -FMath::RadiansToDegrees(ZXY.Pitch),
+        FMath::RadiansToDegrees(ZXY.Roll));
 }
 #pragma endregion
 
 FVector ViveSR_DualCameraImageCapture::GetDistortedLocalPosition(DualCameraIndex eye)
 {
-	if (eye == DualCameraIndex::LEFT)
-		return Position(distorted_pose_left);
-	else if (eye == DualCameraIndex::RIGHT)
-		return Position(distorted_pose_right);
-	else
-		return FVector(0, 0, 0);
+    if (eye == DualCameraIndex::LEFT)
+        return Position(distorted_pose_left);
+    else if (eye == DualCameraIndex::RIGHT)
+        return Position(distorted_pose_right);
+    else
+        return FVector(0, 0, 0);
 }
 FRotator ViveSR_DualCameraImageCapture::GetDistortedLocalRotation(DualCameraIndex eye)
 {
-	if (eye == DualCameraIndex::LEFT)
-		return FMatrixToRotator(distorted_pose_left);
-	else if (eye == DualCameraIndex::RIGHT)
-		return FMatrixToRotator(distorted_pose_right);
-	else
-		return FRotator(0, 0, 0);
+    if (eye == DualCameraIndex::LEFT)
+        return FMatrixToRotator(distorted_pose_left);
+    else if (eye == DualCameraIndex::RIGHT)
+        return FMatrixToRotator(distorted_pose_right);
+    else
+        return FRotator(0, 0, 0);
 }
 FVector ViveSR_DualCameraImageCapture::GetUndistortedLocalPosition(DualCameraIndex eye)
 {
-	if (eye == DualCameraIndex::LEFT)
-		return Position(undistorted_pose_left);
-	else if (eye == DualCameraIndex::RIGHT)
-		return Position(undistorted_pose_right);
-	else
-		return FVector(0, 0, 0); 
+    if (eye == DualCameraIndex::LEFT)
+        return Position(undistorted_pose_left);
+    else if (eye == DualCameraIndex::RIGHT)
+        return Position(undistorted_pose_right);
+    else
+        return FVector(0, 0, 0);
 }
 FRotator ViveSR_DualCameraImageCapture::GetUndistortedLocalRotation(DualCameraIndex eye)
 {
-	if (eye == DualCameraIndex::LEFT)
-		return FMatrixToRotator(undistorted_pose_left);
-	else if (eye == DualCameraIndex::RIGHT)
-		return FMatrixToRotator(undistorted_pose_right);
-	else
-		return FRotator(0, 0, 0);   
+    if (eye == DualCameraIndex::LEFT)
+        return FMatrixToRotator(undistorted_pose_left);
+    else if (eye == DualCameraIndex::RIGHT)
+        return FMatrixToRotator(undistorted_pose_right);
+    else
+        return FRotator(0, 0, 0);
 }
 
 FVector ViveSR_DualCameraImageCapture::GetDepthLocalPosition()
 {
-	return Position(depth_pose);
+    return Position(depth_pose);
 }
 FRotator ViveSR_DualCameraImageCapture::GetDepthLocalRotation()
 {
-	return FMatrixToRotator(depth_pose);
+    return FMatrixToRotator(depth_pose);
 }
 
 
@@ -802,9 +1486,9 @@ int ViveSR_DualCameraImageCapture::EnableDepthProcess(bool active)
 }
 int ViveSR_DualCameraImageCapture::EnableDepthRefinement(bool active)
 {
-	int result = ViveSR::SRWork::Depth::SetDepthParameterBool(ViveSR::Depth::Cmd::ENABLE_REFINEMENT, active);
-	if (result == ViveSR::Error::WORK) is_depth_refinement_enabled = active;
-	return result;
+    int result = ViveSR::SRWork::Depth::SetDepthParameterBool(ViveSR::Depth::Cmd::ENABLE_REFINEMENT, active);
+    if (result == ViveSR::Error::WORK) is_depth_refinement_enabled = active;
+    return result;
 }
 bool ViveSR_DualCameraImageCapture::IsDepthRefinementActive()
 {
@@ -814,130 +1498,130 @@ bool ViveSR_DualCameraImageCapture::IsDepthRefinementActive()
 }
 int ViveSR_DualCameraImageCapture::EnableDepthEdgeEnhance(bool active)
 {
-	int result = ViveSR::SRWork::Depth::SetDepthParameterBool(ViveSR::Depth::Cmd::ENABLE_EDGE_ENHANCE, active);
-	if (result == ViveSR::Error::WORK) is_depth_edge_enhance_enabled = active;
-	return result;
+    int result = ViveSR::SRWork::Depth::SetDepthParameterBool(ViveSR::Depth::Cmd::ENABLE_EDGE_ENHANCE, active);
+    if (result == ViveSR::Error::WORK) is_depth_edge_enhance_enabled = active;
+    return result;
 }
 int ViveSR_DualCameraImageCapture::SetDepthCase(ViveSR::Depth::DepthCase depthCase)
 {
-	int result = ViveSR::Error::FAILED;
-	result = ViveSR::SRWork::Depth::SetDepthParameterInt( ViveSR::Depth::Cmd::CHANGE_DEPTH_CASE, (int)depthCase);
-	if (result == ViveSR::Error::WORK) depth_case = depthCase;
-	return result;
+    int result = ViveSR::Error::FAILED;
+    result = ViveSR::SRWork::Depth::SetDepthParameterInt(ViveSR::Depth::Cmd::CHANGE_DEPTH_CASE, (int)depthCase);
+    if (result == ViveSR::Error::WORK) depth_case = depthCase;
+    return result;
 }
 
 int ViveSR_DualCameraImageCapture::SetDepthConfidenceThreshold(float value)
 {
-	int result = ViveSR::SRWork::Depth::SetDepthParameterFloat( ViveSR::Depth::Param::CONFIDENCE_THRESHOLD, value);
-	
-	if (result == ViveSR::Error::WORK) depth_confidence_threshold = value;
-	return result;
+    int result = ViveSR::SRWork::Depth::SetDepthParameterFloat(ViveSR::Depth::Param::CONFIDENCE_THRESHOLD, value);
+
+    if (result == ViveSR::Error::WORK) depth_confidence_threshold = value;
+    return result;
 }
 int ViveSR_DualCameraImageCapture::SetDepthDenoiseGuidedFilter(int value)
 {
-	int result = ViveSR::SRWork::Depth::SetDepthParameterInt( ViveSR::Depth::Param::DENOISE_GUIDED_FILTER, value);
-	if (result == ViveSR::Error::WORK) depth_denoise_guided_filter = value;
-	return result;
+    int result = ViveSR::SRWork::Depth::SetDepthParameterInt(ViveSR::Depth::Param::DENOISE_GUIDED_FILTER, value);
+    if (result == ViveSR::Error::WORK) depth_denoise_guided_filter = value;
+    return result;
 }
 int ViveSR_DualCameraImageCapture::SetDepthDenoiseMedianFilter(int value)
 {
-	int result = ViveSR::SRWork::Depth::SetDepthParameterInt(ViveSR::Depth::Param::DENOISE_MEDIAN_FILTER, value);
-	if (result == ViveSR::Error::WORK) depth_denoise_median_filter = value;
-	return result;
+    int result = ViveSR::SRWork::Depth::SetDepthParameterInt(ViveSR::Depth::Param::DENOISE_MEDIAN_FILTER, value);
+    if (result == ViveSR::Error::WORK) depth_denoise_median_filter = value;
+    return result;
 }
 #pragma endregion
 
 #pragma region Camera Commands / Parameters
-int ViveSR_DualCameraImageCapture::GetCameraSettings(ViveSR::PassThrough::CameraControlType item, ViveSR::PassThrough::CameraSettings *param_info)
+int ViveSR_DualCameraImageCapture::GetCameraSettings(ViveSR::PassThrough::CameraControlType item, ViveSR::PassThrough::CameraSettings* param_info)
 {
-	int result = (int)ViveSR::Error::FAILED;
-	result = ViveSR::SRWork::PassThrough::GetCameraStatus(item, &(param_info->Status));
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraStatus %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::GetCameraDefaultValue(item, &(param_info->DefaultValue));
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraDefaultValue %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::GetCameraMin(item, &(param_info->Min));
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraMin %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::GetCameraMax(item, &(param_info->Max));
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraMax %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::GetCameraStep(item, &(param_info->Step));
-	if (result != (int)ViveSR::Error::WORK || &(param_info->Step) == NULL) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraStep %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::GetCameraDefaultMode(item, &(param_info->DefaultMode));
-	if (result != (int)ViveSR::Error::WORK || &(param_info->DefaultMode) == NULL) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraDefaultMode %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::GetCameraValue(item, &(param_info->Value));
-	if (result != (int)ViveSR::Error::WORK || &(param_info->Value) == NULL) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraValue %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::GetCameraMode(item, &(param_info->Mode));
-	if (result != (int)ViveSR::Error::WORK || &(param_info->Mode) == NULL) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraMode %d"), result);
-		return result;
-	}
-	UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraQuality %d"), result);
-	return result;
+    int result = (int)ViveSR::Error::FAILED;
+    result = ViveSR::SRWork::PassThrough::GetCameraStatus(item, &(param_info->Status));
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraStatus %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::GetCameraDefaultValue(item, &(param_info->DefaultValue));
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraDefaultValue %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::GetCameraMin(item, &(param_info->Min));
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraMin %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::GetCameraMax(item, &(param_info->Max));
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraMax %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::GetCameraStep(item, &(param_info->Step));
+    if (result != (int)ViveSR::Error::WORK || &(param_info->Step) == NULL) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraStep %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::GetCameraDefaultMode(item, &(param_info->DefaultMode));
+    if (result != (int)ViveSR::Error::WORK || &(param_info->DefaultMode) == NULL) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraDefaultMode %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::GetCameraValue(item, &(param_info->Value));
+    if (result != (int)ViveSR::Error::WORK || &(param_info->Value) == NULL) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraValue %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::GetCameraMode(item, &(param_info->Mode));
+    if (result != (int)ViveSR::Error::WORK || &(param_info->Mode) == NULL) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraMode %d"), result);
+        return result;
+    }
+    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] GetCameraQuality %d"), result);
+    return result;
 }
-int ViveSR_DualCameraImageCapture::SetCamera(ViveSR::PassThrough::CameraControlType item, ViveSR::PassThrough::CameraSettings *param_info)
+int ViveSR_DualCameraImageCapture::SetCamera(ViveSR::PassThrough::CameraControlType item, ViveSR::PassThrough::CameraSettings* param_info)
 {
-	int result = (int)ViveSR::Error::FAILED;
-	result = ViveSR::SRWork::PassThrough::SetCameraStatus(item, (param_info->Status));
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraStatus %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::SetCameraDefaultValue(item, (param_info->DefaultValue));
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraDefaultValue %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::SetCameraMin(item, (param_info->Min));
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraMin %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::SetCameraMax(item, param_info->Max);
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraMax %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::SetCameraStep(item, param_info->Step);
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraStep %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::SetCameraDefaultMode(item, param_info->DefaultMode);
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraDefaultMode %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::SetCameraValue(item, param_info->Value);
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraValue %d"), result);
-		return result;
-	}
-	result = ViveSR::SRWork::PassThrough::SetCameraMode(item, param_info->Mode);
-	if (result != (int)ViveSR::Error::WORK) {
-		UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraMode %d"), result);
-		return result;
-	}
-	UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraQuality %d"), result);
-	return result;
+    int result = (int)ViveSR::Error::FAILED;
+    result = ViveSR::SRWork::PassThrough::SetCameraStatus(item, (param_info->Status));
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraStatus %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::SetCameraDefaultValue(item, (param_info->DefaultValue));
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraDefaultValue %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::SetCameraMin(item, (param_info->Min));
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraMin %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::SetCameraMax(item, param_info->Max);
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraMax %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::SetCameraStep(item, param_info->Step);
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraStep %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::SetCameraDefaultMode(item, param_info->DefaultMode);
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraDefaultMode %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::SetCameraValue(item, param_info->Value);
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraValue %d"), result);
+        return result;
+    }
+    result = ViveSR::SRWork::PassThrough::SetCameraMode(item, param_info->Mode);
+    if (result != (int)ViveSR::Error::WORK) {
+        UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraMode %d"), result);
+        return result;
+    }
+    UE_LOG(LogTemp, Warning, TEXT("[ViveSR] SetCameraQuality %d"), result);
+    return result;
 }
 #pragma endregion

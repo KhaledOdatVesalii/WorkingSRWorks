@@ -24,22 +24,22 @@
 #include "Windows/HideWindowsPlatformAtomics.h"
 
 /**
- * 
+ *
  */
 namespace ViveSR {
-    namespace PassThrough {
-        struct CameraSettings
-        {
-            int32_t Status;
-            int32_t DefaultValue;
-            int32_t Min;
-            int32_t Max;
-            int32_t Step;
-            int32_t DefaultMode;
-            int32_t Value;
-            int32_t Mode;  // AUTO = 1, MANUAL = 2
-        };
-    }
+	namespace PassThrough {
+		struct CameraSettings
+		{
+			int32_t Status;
+			int32_t DefaultValue;
+			int32_t Min;
+			int32_t Max;
+			int32_t Step;
+			int32_t DefaultMode;
+			int32_t Value;
+			int32_t Mode;  // AUTO = 1, MANUAL = 2
+		};
+	}
 }
 class ViveSR_DualCameraImageCapture
 {
@@ -55,12 +55,12 @@ public:
 	int undistorted_img_width = 1150;
 	int undistorted_img_height = 750;
 	int UndistortedImageChannel = 4;
-	
+
 	int depth_img_width = 640;
 	int depth_img_height = 480;
 	int depth_img_channel = 1;
 	int depth_data_size = 4;
-	
+
 	double distorted_cx_left;
 	double distorted_cy_left;
 	double distorted_cx_right;
@@ -69,7 +69,7 @@ public:
 	double undistorted_cy_left;
 	double undistorted_cx_right;
 	double undistorted_cy_right;
-	double *camera_params = new double[22];
+	double* camera_params = new double[22];
 	FMatrix distorted_pose_left, distorted_pose_right;
 	FMatrix undistorted_pose_left, undistorted_pose_right;
 	FMatrix depth_pose;
@@ -89,7 +89,7 @@ public:
 	void GetDepthTexture(UTexture2D*& imageDepth, int& frame_idx, int& time_idx);
 
 	bool UpdateDistortedImage();
-    bool UpdateUndistortedImage();
+	bool UpdateUndistortedImage();
 	bool UpdateDepthImage();
 
 	bool is_depth_processing = false;
@@ -99,38 +99,38 @@ public:
 
 	int EnableDepthProcess(bool active);
 	int EnableDepthRefinement(bool active);
-    bool IsDepthRefinementActive();
+	bool IsDepthRefinementActive();
 	int EnableDepthEdgeEnhance(bool active);
 	int SetDepthCase(ViveSR::Depth::DepthCase depthCase);
 	int SetDepthConfidenceThreshold(float value);
 	int SetDepthDenoiseGuidedFilter(int value);
 	int SetDepthDenoiseMedianFilter(int value);
 
-	int GetCameraSettings(ViveSR::PassThrough::CameraControlType item, ViveSR::PassThrough::CameraSettings *param_info);
-	int SetCamera(ViveSR::PassThrough::CameraControlType item, ViveSR::PassThrough::CameraSettings *param_info);
-    
+	int GetCameraSettings(ViveSR::PassThrough::CameraControlType item, ViveSR::PassThrough::CameraSettings* param_info);
+	int SetCamera(ViveSR::PassThrough::CameraControlType item, ViveSR::PassThrough::CameraSettings* param_info);
+
 	double focal_length_left;
 	double focal_length_right;
-	double base_line;	
+	double base_line;
 	float head_to_camera_offset[6];
 
-    bool img4K_ready = false;
-    
-    int get_PassThrough_result;
+	bool img4K_ready = false;
 
-    bool is_gpu_path = false;
-    void SetGPUMethod(bool is_gpu_path);
+	int get_PassThrough_result;
+
+	bool is_gpu_path = false;
+	void SetGPUMethod(bool is_gpu_path);
 
 	float GetGamma();
-    bool IsHorus();
-    ViveSR::SRWork::PassThrough::PassThroughData *pass_through_data = nullptr;
-    ViveSR::SRWork::PassThrough4K::PassThrough4KData *pass_through4K_data = nullptr;
+	bool IsHorus();
+	ViveSR::SRWork::PassThrough::PassThroughData* pass_through_data = nullptr;
+	ViveSR::SRWork::PassThrough4K::PassThrough4KData* pass_through4K_data = nullptr;
 private:
-	static ViveSR_DualCameraImageCapture *Mgr;
+	static ViveSR_DualCameraImageCapture* Mgr;
 
 	void GetParameters();
 	void TextureRegionCleanUp(uint8* rawData, const FUpdateTextureRegion2D* region) {};
-    bool GetD3D11ShaderResourceView(void* texture_shared_handle, void** shader_resource_view);
+	bool GetD3D11ShaderResourceView(void* texture_shared_handle, void** shader_resource_view);
 
 	TFunction<void(uint8*, const FUpdateTextureRegion2D*)> texCleanUpFP = [this](uint8* rawData, const FUpdateTextureRegion2D* region) { TextureRegionCleanUp(rawData, region); };
 
@@ -139,35 +139,35 @@ private:
 	UTexture2D* undistorted_texture_left = nullptr;
 	UTexture2D* undistorted_texture_right = nullptr;
 	UTexture2D* depth_texture = nullptr;
-  
 
-    std::vector<ID3D11Resource*>resource_from_handle_left;
-    std::vector<ID3D11Resource*>resource_from_handle_right;
-    
-    ID3D11Device *native_device = nullptr;
-    ID3D11DeviceContext* device_context =nullptr;
 
-    ID3D11ShaderResourceView* srv_from_handle_left = nullptr;
-    ID3D11ShaderResourceView* srv_from_handle_right = nullptr;
+	std::vector<ID3D11Resource*>resource_from_handle_left;
+	std::vector<ID3D11Resource*>resource_from_handle_right;
+
+	void* native_device = nullptr;
+	ID3D11DeviceContext* device_context = nullptr;
+
+	ID3D11ShaderResourceView* srv_from_handle_left = nullptr;
+	ID3D11ShaderResourceView* srv_from_handle_right = nullptr;
 
 
 	FUpdateTextureRegion2D* distorted_texture_region = nullptr;
 	FUpdateTextureRegion2D* undistorted_texture_region = nullptr;
 	FUpdateTextureRegion2D* depth_texture_region = nullptr;
 
-	
-    
-    std::vector<void*>srv_left;
-    std::vector<void*>srv_right;
-    
-    TMap<int, int> idx_map;
 
-    int vertex_idx = 0;
 
-	ViveSR::SRWork::Depth::DepthData *depth_data = nullptr;
-	uint8 *distorted_raw_bgra_left = nullptr, *distorted_raw_bgra_right = nullptr;
-	uint8 *undistorted_raw_bgra_left = nullptr, *undistorted_raw_bgra_right = nullptr;
-	uint8 *depth_raw = nullptr;
+	std::vector<void*>srv_left;
+	std::vector<void*>srv_right;
+
+	TMap<int, int> idx_map;
+
+	int vertex_idx = 0;
+
+	ViveSR::SRWork::Depth::DepthData* depth_data = nullptr;
+	uint8* distorted_raw_bgra_left = nullptr, * distorted_raw_bgra_right = nullptr;
+	uint8* undistorted_raw_bgra_left = nullptr, * undistorted_raw_bgra_right = nullptr;
+	uint8* depth_raw = nullptr;
 
 	FVector Position(FMatrix m);
 };
